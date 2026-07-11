@@ -46,6 +46,19 @@ static const char *edcolor[NED] = { "\033[36m", "\033[33m", "\033[32m" };
 static int use_color;
 static int termwidth = 80;
 
+/* active editions, in the order their columns are displayed */
+static int order[NED];
+static int norder;
+
+static void add_lang(int ed)
+{
+	int i;
+	for (i = 0; i < norder; i++)
+		if (order[i] == ed)
+			return;
+	order[norder++] = ed;
+}
+
 static const char *color(const char *c) { return use_color ? c : ""; }
 #define C_RESET color("\033[0m")
 #define C_BOLD  color("\033[1m")
@@ -327,20 +340,21 @@ static int in_range(Edition *e, size_t i, const Ref *r)
 	       KEY(e->v[i].chap, e->v[i].verse) <= r->to;
 }
 
-static int lookup(FILE *out, const Ref *r, int langmask)
+static int lookup(FILE *out, const Ref *r)
 {
 	size_t idx[NED];
-	int ed, printed = 0;
+	int i, ed, printed = 0;
 
-	for (ed = 0; ed < NED; ed++)
-		idx[ed] = range_start(&eds[ed], r);
+	for (i = 0; i < norder; i++)
+		idx[order[i]] = range_start(&eds[order[i]], r);
 
 	for (;;) {
 		long key = LONG_MAX;
 		int chap = 0, verse = 0;
 
-		for (ed = 0; ed < NED; ed++)
-			if ((langmask & (1 << ed)) && in_range(&eds[ed], idx[ed], r)) {
+		for (i = 0; i < norder; i++) {
+			ed = order[i];
+			if (in_range(&eds[ed], idx[ed], r)) {
 				Verse *v = &eds[ed].v[idx[ed]];
 				if (KEY(v->chap, v->verse) < key) {
 					key = KEY(v->chap, v->verse);
@@ -348,6 +362,7 @@ static int lookup(FILE *out, const Ref *r, int langmask)
 					verse = v->verse;
 				}
 			}
+		}
 		if (key == LONG_MAX)
 			break;
 
@@ -355,9 +370,8 @@ static int lookup(FILE *out, const Ref *r, int langmask)
 			fputc('\n', out);
 		fprintf(out, "%s%s %d:%d%s\n", C_BOLD, books[r->book].display,
 		        chap, verse, C_RESET);
-		for (ed = 0; ed < NED; ed++) {
-			if (!(langmask & (1 << ed)))
-				continue;
+		for (i = 0; i < norder; i++) {
+			ed = order[i];
 			if (in_range(&eds[ed], idx[ed], r) &&
 			    KEY(eds[ed].v[idx[ed]].chap, eds[ed].v[idx[ed]].verse) == key) {
 				edlabel[ED_GRB] = greek_label(r->book);
@@ -376,14 +390,13 @@ static int lookup(FILE *out, const Ref *r, int langmask)
 
 /* ---------- search and listing ---------- */
 
-static void search(FILE *out, const char *pat, int langmask)
+static void search(FILE *out, const char *pat)
 {
-	int ed;
+	int j, ed;
 	size_t i;
 
-	for (ed = 0; ed < NED; ed++) {
-		if (!(langmask & (1 << ed)))
-			continue;
+	for (j = 0; j < norder; j++) {
+		ed = order[j];
 		for (i = 0; i < eds[ed].n; i++) {
 			Verse *v = &eds[ed].v[i];
 			if (!strcasestr(v->text, pat))
@@ -426,10 +439,14 @@ static void usage(void)
 	      "Look up Bible verses in Greek (Septuagint / Greek NT), Latin\n"
 	      "(Vulgate) and English (Douay-Rheims).\n"
 	      "\n"
-	      "  -g  Greek only     -l  Latin only     -e  English only\n"
-	      "      (flags combine: -gl shows Greek and Latin)\n"
+	      "  -g  Greek     -l  Latin     -e  English\n"
+	      "      combine to choose the columns and their order:\n"
+	      "      -eg shows English then Greek (default: all three)\n"
 	      "  -s  search verse text for a pattern\n"
 	      "  -L  list books and the editions each is available in\n"
+	      "\n"
+	      "Set HEXAPLA_LANGS (e.g. 'gl' or 'elg') to change the default\n"
+	      "columns and order; command-line flags override it.\n"
 	      "\n"
 	      "examples:\n"
 	      "  hexapla John 3:16          hexapla Gen 1:1-10\n"
@@ -444,7 +461,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-	int opt, langmask = 0, list = 0, ed;
+	int opt, list = 0, i, ed;
 	const char *pat = NULL, *dir;
 	FILE *out = stdout;
 	Ref r;
@@ -453,16 +470,29 @@ int main(int argc, char **argv)
 
 	while ((opt = getopt(argc, argv, "gleLs:h")) != -1) {
 		switch (opt) {
-		case 'g': langmask |= 1 << ED_GRB; break;
-		case 'l': langmask |= 1 << ED_VUL; break;
-		case 'e': langmask |= 1 << ED_DRB; break;
+		case 'g': add_lang(ED_GRB); break;
+		case 'l': add_lang(ED_VUL); break;
+		case 'e': add_lang(ED_DRB); break;
 		case 'L': list = 1; break;
 		case 's': pat = optarg; break;
 		default: usage();
 		}
 	}
-	if (!langmask)
-		langmask = (1 << NED) - 1;
+	if (!norder) {
+		const char *s = getenv("HEXAPLA_LANGS");
+		for (; s && *s; s++)
+			switch (*s) {
+			case 'g': add_lang(ED_GRB); break;
+			case 'l': add_lang(ED_VUL); break;
+			case 'e': add_lang(ED_DRB); break;
+			default:
+				fprintf(stderr, "hexapla: ignoring unknown "
+				        "language '%c' in HEXAPLA_LANGS\n", *s);
+			}
+	}
+	if (!norder)
+		for (ed = 0; ed < NED; ed++)
+			add_lang(ed);
 	argc -= optind;
 	argv += optind;
 	if (!list && !pat && argc == 0)
@@ -479,8 +509,12 @@ int main(int argc, char **argv)
 		return 1;
 
 	dir = datadir();
-	for (ed = 0; ed < NED; ed++)
-		load_edition(ed, dir);
+	if (list)
+		for (ed = 0; ed < NED; ed++)
+			load_edition(ed, dir);
+	else
+		for (i = 0; i < norder; i++)
+			load_edition(order[i], dir);
 
 	if (use_color) {
 		const char *pager = getenv("PAGER");
@@ -492,8 +526,8 @@ int main(int argc, char **argv)
 	if (list)
 		list_books(out);
 	else if (pat)
-		search(out, pat, langmask);
-	else if (!lookup(out, &r, langmask))
+		search(out, pat);
+	else if (!lookup(out, &r))
 		fprintf(stderr, "hexapla: no verses found for that reference\n");
 
 	if (out != stdout)

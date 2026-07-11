@@ -31,14 +31,19 @@ hexapla -L
 - `hexapla Psalms 22` — a whole chapter
 - `hexapla Jude` — a whole book
 - `hexapla Gen 1:31-2:2` — a range across chapters
-- `hexapla -g Matt 5:3-12` — one language only (`-g` Greek, `-l` Latin,
-  `-e` English; flags combine)
+- `hexapla -g Matt 5:3-12` — choose languages (`-g` Greek, `-l` Latin,
+  `-e` English); flags combine, and their order sets the column order
+  (`-eg` shows English then Greek)
 - `hexapla -s 'vale of tears'` — search verse text (Greek search is
   byte-exact: match accents and case)
 - `hexapla -L` — list all books, the editions each is available in, and
   accepted abbreviations
 
 Output is paged through `$PAGER` (default `less`) when on a terminal.
+
+To change the default columns without typing flags every time, set
+`HEXAPLA_LANGS` in your shell rc — e.g. `export HEXAPLA_LANGS=ge` shows
+Greek and English only, Greek first. Command-line flags override it.
 
 ## Names and numbering
 
