@@ -133,8 +133,8 @@ static void load_edition(int ed, const char *dir)
 	FILE *f;
 	long size;
 	char *p, *line;
-	const char *prevname = "";
-	int prevbook = -1, prevoff = 0;
+	const char *prevname = "", *prevtok = "";
+	int prevbook = -1, prevoff = 0, mergedchap = 0;
 
 	snprintf(path, sizeof path, "%s/%s", dir, edfile[ed]);
 	f = fopen(path, "r");
@@ -154,8 +154,8 @@ static void load_edition(int ed, const char *dir)
 		p += 3; /* UTF-8 BOM */
 
 	while (p && *p) {
-		char *fields[6];
-		int nf = 0, book, choff;
+		char *fields[6], *text;
+		int nf = 0, book, choff, chap, verse;
 
 		line = p;
 		p = strchr(p, '\n');
@@ -169,7 +169,7 @@ static void load_edition(int ed, const char *dir)
 			*line++ = '\0';
 			fields[nf++] = line;
 		}
-		if (nf < 6)
+		if (nf < 5)
 			continue;
 
 		if (strcmp(fields[0], prevname) == 0) {
@@ -180,12 +180,34 @@ static void load_edition(int ed, const char *dir)
 			prevname = fields[0];
 			prevbook = book;
 			prevoff = choff;
+			prevtok = "";
+			mergedchap = 0;
 		}
 		if (book < 0)
 			continue;
+
+		if (nf < 6) {
+			/* Hosea and Zechariah in grb.tsv lack the tab between the
+			 * book number and the chapter, so "28" and "1" arrive as
+			 * the single field "281" and the row is a column short.
+			 * The chapters still appear in order, so count them off as
+			 * that joined value changes instead of trying to guess
+			 * where the book number ends. */
+			if (strcmp(fields[2], prevtok) != 0) {
+				prevtok = fields[2];
+				mergedchap++;
+			}
+			chap = mergedchap;
+			verse = atoi(fields[3]);
+			text = fields[4];
+		} else {
+			chap = atoi(fields[3]);
+			verse = atoi(fields[4]);
+			text = fields[5];
+		}
 		if (ed == ED_GRB)
-			strip_sigla(fields[5]);
-		addverse(e, book, atoi(fields[3]) + choff, atoi(fields[4]), fields[5]);
+			strip_sigla(text);
+		addverse(e, book, chap + choff, verse, text);
 	}
 }
 
