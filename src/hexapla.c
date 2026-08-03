@@ -218,7 +218,7 @@ static void load_edition(int ed, const char *dir)
 static void print_wrapped(FILE *out, int indent, const char *text)
 {
 	int width = termwidth - indent;
-	int col = 0;
+	int col = 0, linestart = 1;
 	const char *word = text;
 
 	if (width < 20)
@@ -234,6 +234,7 @@ static void print_wrapped(FILE *out, int indent, const char *text)
 		memset(&st, 0, sizeof st);
 		while (*end && *end != ' ') {
 			wchar_t wc;
+			int w;
 			size_t n = mbrtowc(&wc, end, MB_CUR_MAX, &st);
 			if (n == (size_t)-1 || n == (size_t)-2) {
 				end++;
@@ -244,19 +245,28 @@ static void print_wrapped(FILE *out, int indent, const char *text)
 			if (n == 0)
 				break;
 			end += n;
-			wlen += wcwidth(wc) > 0 ? wcwidth(wc) : 0;
+			/* wcwidth returns -1 for anything it cannot classify,
+			 * which outside a UTF-8 locale is every byte of Greek or
+			 * accented Latin; count those as one column.  Genuine
+			 * zero-width combining marks return 0 and stay uncounted. */
+			w = wcwidth(wc);
+			wlen += w < 0 ? 1 : w;
 		}
 		if (word == end)
 			break;
-		if (col && col + 1 + wlen > width) {
+		/* Track whether the line already holds a word separately from
+		 * its width: a word whose width counts as zero must still be
+		 * followed by a space. */
+		if (!linestart && col + 1 + wlen > width) {
 			fprintf(out, "\n%*s", indent, "");
 			col = 0;
-		} else if (col) {
+		} else if (!linestart) {
 			fputc(' ', out);
 			col++;
 		}
 		fwrite(word, 1, end - word, out);
 		col += wlen;
+		linestart = 0;
 		word = end;
 	}
 	fputc('\n', out);
