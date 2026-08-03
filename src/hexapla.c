@@ -13,7 +13,6 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <wchar.h>
 
 #include "books.h"
 
@@ -213,6 +212,61 @@ static void load_edition(int ed, const char *dir)
 
 /* ---------- output ---------- */
 
+/* Decode one UTF-8 sequence and return the bytes consumed.  The data files
+ * are always UTF-8, so decoding them here keeps the layout correct whatever
+ * locale the caller happens to be in; mbrtowc would fall back to single
+ * bytes under LANG=C and mis-measure every Greek and accented Latin word.
+ * Malformed bytes are consumed one at a time as U+FFFD so we always advance. */
+static int utf8_decode(const char *s, unsigned *cp)
+{
+	const unsigned char *u = (const unsigned char *)s;
+	unsigned c = u[0];
+	int len, i;
+
+	if (c < 0x80) {
+		*cp = c;
+		return 1;
+	} else if ((c & 0xe0) == 0xc0) {
+		c &= 0x1f;
+		len = 2;
+	} else if ((c & 0xf0) == 0xe0) {
+		c &= 0x0f;
+		len = 3;
+	} else if ((c & 0xf8) == 0xf0) {
+		c &= 0x07;
+		len = 4;
+	} else {
+		*cp = 0xfffd;
+		return 1;
+	}
+
+	for (i = 1; i < len; i++) {
+		if ((u[i] & 0xc0) != 0x80) {
+			*cp = 0xfffd;
+			return 1;
+		}
+		c = (c << 6) | (u[i] & 0x3f);
+	}
+	*cp = c;
+	return len;
+}
+
+/* Combining marks and zero-width formatting characters sit on the preceding
+ * character and occupy no column of their own.  Everything these texts
+ * actually contain -- Greek, polytonic Greek, Latin, punctuation -- is a
+ * single column, so no East Asian wide ranges are needed here. */
+static int cp_width(unsigned cp)
+{
+	if ((cp >= 0x0300 && cp <= 0x036f) ||
+	    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+	    (cp >= 0x20d0 && cp <= 0x20ff) ||
+	    (cp >= 0xfe20 && cp <= 0xfe2f) ||
+	    (cp >= 0x200b && cp <= 0x200f) ||
+	    cp == 0xfeff)
+		return 0;
+	return 1;
+}
+
 /* Wrap `text` to the terminal width with a hanging indent, counting
  * display columns of UTF-8 text rather than bytes. */
 static void print_wrapped(FILE *out, int indent, const char *text)
@@ -226,31 +280,15 @@ static void print_wrapped(FILE *out, int indent, const char *text)
 	while (*word) {
 		const char *end = word;
 		int wlen = 0;
-		mbstate_t st;
 
 		while (*end == ' ')
 			end++;
 		word = end;
-		memset(&st, 0, sizeof st);
 		while (*end && *end != ' ') {
-			wchar_t wc;
-			int w;
-			size_t n = mbrtowc(&wc, end, MB_CUR_MAX, &st);
-			if (n == (size_t)-1 || n == (size_t)-2) {
-				end++;
-				wlen++;
-				memset(&st, 0, sizeof st);
-				continue;
-			}
-			if (n == 0)
-				break;
-			end += n;
-			/* wcwidth returns -1 for anything it cannot classify,
-			 * which outside a UTF-8 locale is every byte of Greek or
-			 * accented Latin; count those as one column.  Genuine
-			 * zero-width combining marks return 0 and stay uncounted. */
-			w = wcwidth(wc);
-			wlen += w < 0 ? 1 : w;
+			unsigned cp;
+
+			end += utf8_decode(end, &cp);
+			wlen += cp_width(cp);
 		}
 		if (word == end)
 			break;
