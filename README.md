@@ -22,7 +22,7 @@ DRB │ For God so loved the world, as to give his only begotten Son; that
 ## Usage
 
 ```
-hexapla [-gle] book [chapter[:verse[-verse]]]
+hexapla [-gle] [book [chapter[:verse[-verse]]]]
 hexapla [-gle] -s pattern
 hexapla -L
 ```
@@ -40,6 +40,31 @@ hexapla -L
   accepted abbreviations
 
 Output is paged through `$PAGER` (default `less`) when on a terminal.
+
+## The prompt
+
+Run `hexapla` with no arguments and it opens at a prompt; quitting the
+pager after a lookup returns there too, so you can keep reading without
+restarting:
+
+```
+hexapla> John 3:16
+hexapla> -g Matt 5:3-12
+hexapla> -s vale of tears
+```
+
+Anything that works on the command line works at the prompt, and search
+patterns need no quoting. Up and down arrows walk earlier references,
+and that history is kept between sessions (in
+`$XDG_STATE_HOME/hexapla/history`, or `~/.local/state/hexapla/history`;
+override with `HEXAPLA_HISTFILE`). A line of nothing but language flags
+— `-el` — sets the default columns for the rest of the session.
+
+Type `?` for help, `books` to list every book, `q` (or ctrl-D) to quit.
+
+The prompt only appears when input and output are both terminals, so
+pipes and redirects still print once and exit; `-1` forces that
+behaviour on a terminal too.
 
 To change the default columns without typing flags every time, set
 `HEXAPLA_LANGS` in your shell rc — e.g. `export HEXAPLA_LANGS=ge` shows
@@ -79,6 +104,10 @@ Modern names and common abbreviations (`Joshua`, `Rev`, `1 Chronicles`,
 make
 sudo make install    # installs to /usr/local, data to /usr/local/share/hexapla
 ```
+
+The prompt uses GNU readline for line editing and history. To build
+without that dependency, `make READLINE=0` — the prompt still works and
+still records history, but without arrow-key recall.
 
 To run from the source tree without installing, run it from this
 directory (it finds `./data`), or point `HEXAPLA_DATA` at the data

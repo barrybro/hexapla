@@ -8,11 +8,18 @@
 #include <errno.h>
 #include <limits.h>
 #include <locale.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef HAVE_READLINE
+#include <readline/history.h>
+#include <readline/readline.h>
+#endif
 
 #include "books.h"
 
@@ -24,6 +31,8 @@
 #define KEY(c, v)   ((long)(c) * 1000L + (v))
 #define CHAP_ALL(c) KEY(c, 999)
 
+#define HISTMAX 500     /* entries kept in the on-disk history file */
+
 typedef struct {
 	int book;
 	int chap, verse;
@@ -34,6 +43,7 @@ typedef struct {
 	Verse *v;
 	size_t n, cap;
 	char *raw;              /* whole TSV file; verse texts point into it */
+	int loaded;
 	int hasbook[128];
 } Edition;
 
@@ -48,6 +58,11 @@ static int termwidth = 80;
 /* active editions, in the order their columns are displayed */
 static int order[NED];
 static int norder;
+
+/* column order the interactive prompt falls back to; a per-command flag
+ * such as "-g John 3:16" overrides it for that one command only */
+static int deforder[NED];
+static int defnorder;
 
 static void add_lang(int ed)
 {
@@ -210,6 +225,18 @@ static void load_edition(int ed, const char *dir)
 	}
 }
 
+/* Editions are loaded on first use and kept: the interactive prompt can
+ * switch columns between commands without paying to re-read a 10MB TSV. */
+static const char *datapath;
+
+static void ensure_loaded(int ed)
+{
+	if (eds[ed].loaded)
+		return;
+	load_edition(ed, datapath);
+	eds[ed].loaded = 1;
+}
+
 /* ---------- output ---------- */
 
 /* Decode one UTF-8 sequence and return the bytes consumed.  The data files
@@ -267,6 +294,18 @@ static int cp_width(unsigned cp)
 	return 1;
 }
 
+static int disp_width(const char *s)
+{
+	unsigned cp;
+	int w = 0;
+
+	while (*s) {
+		s += utf8_decode(s, &cp);
+		w += cp_width(cp);
+	}
+	return w;
+}
+
 /* Wrap `text` to the terminal width with a hanging indent, counting
  * display columns of UTF-8 text rather than bytes. */
 static void print_wrapped(FILE *out, int indent, const char *text)
@@ -322,6 +361,30 @@ static void print_verse_line(FILE *out, int ed, const char *text)
 static const char *greek_label(int book)
 {
 	return books[book].nt ? "GNT" : "LXX";
+}
+
+/* ---------- paging ---------- */
+
+/* The pager gets its own process; quitting it early (q in less) leaves us
+ * writing to a closed pipe.  SIGPIPE is ignored program-wide so that just
+ * fails the write instead of killing us mid-session -- output loops watch
+ * ferror() to stop early rather than grinding through a whole book. */
+static FILE *open_pager(void)
+{
+	const char *pager;
+	FILE *pg;
+
+	if (!use_color)
+		return stdout;
+	pager = getenv("PAGER");
+	pg = popen(pager && *pager ? pager : "less -FRX", "w");
+	return pg ? pg : stdout;
+}
+
+static void close_pager(FILE *out)
+{
+	if (out != stdout)
+		pclose(out);
 }
 
 /* ---------- lookup ---------- */
@@ -454,6 +517,8 @@ static int lookup(FILE *out, const Ref *r)
 			}
 		}
 		printed++;
+		if (ferror(out))        /* pager quit on us */
+			break;
 	}
 	return printed;
 }
@@ -476,6 +541,8 @@ static void search(FILE *out, const char *pat)
 			        books[v->book].display, v->chap, v->verse, C_RESET);
 			print_verse_line(out, ed, v->text);
 			fputc('\n', out);
+			if (ferror(out))
+				return;
 		}
 	}
 }
@@ -498,11 +565,471 @@ static void list_books(FILE *out)
 	}
 }
 
+/* ---------- command parsing ---------- */
+
+typedef struct {
+	int list;               /* -L */
+	int once;               /* -1 */
+	int help;               /* -h */
+	const char *pat;        /* -s */
+} Opts;
+
+/* Parse leading option flags, shared by the command line and the prompt so
+ * both accept the same syntax.  Language flags accumulate into the column
+ * order; -s takes the rest of the line as its pattern, so a search phrase
+ * needs no quoting when typed at the prompt.  Returns the index of the
+ * first non-flag token, or -1 on an unknown flag. */
+static int parse_flags(int argc, char **argv, Opts *o, char *patbuf, size_t patsz)
+{
+	int i, j;
+
+	for (i = 0; i < argc; i++) {
+		const char *a = argv[i];
+
+		if (a[0] != '-' || a[1] == '\0')
+			break;
+		for (j = 1; a[j]; j++) {
+			switch (a[j]) {
+			case 'g': add_lang(ED_GRB); break;
+			case 'l': add_lang(ED_VUL); break;
+			case 'e': add_lang(ED_DRB); break;
+			case 'L': o->list = 1; break;
+			case '1': o->once = 1; break;
+			case 'h': o->help = 1; break;
+			case 's':
+				patbuf[0] = '\0';
+				if (a[j + 1]) {
+					snprintf(patbuf, patsz, "%s", a + j + 1);
+				} else {
+					for (i++; i < argc; i++) {
+						if (patbuf[0])
+							strncat(patbuf, " ",
+							        patsz - strlen(patbuf) - 1);
+						strncat(patbuf, argv[i],
+						        patsz - strlen(patbuf) - 1);
+					}
+				}
+				if (!patbuf[0]) {
+					fprintf(stderr, "hexapla: -s needs a pattern\n");
+					return -1;
+				}
+				o->pat = patbuf;
+				return argc;    /* -s consumed the remainder */
+			default:
+				fprintf(stderr, "hexapla: unknown option '-%c'\n", a[j]);
+				return -1;
+			}
+		}
+	}
+	return i;
+}
+
+/* Split a line into whitespace-separated tokens in place, honouring single
+ * and double quotes.  Returns the token count. */
+static int split_line(char *line, char **argv, int max)
+{
+	int n = 0;
+
+	while (*line && n < max) {
+		char *w;
+		char quote = 0;
+
+		while (*line == ' ' || *line == '\t')
+			line++;
+		if (!*line)
+			break;
+		argv[n++] = w = line;
+		while (*line) {
+			if (quote) {
+				if (*line == quote) {
+					quote = 0;
+					line++;
+					continue;
+				}
+			} else if (*line == '\'' || *line == '"') {
+				quote = *line++;
+				continue;
+			} else if (*line == ' ' || *line == '\t') {
+				break;
+			}
+			*w++ = *line++;
+		}
+		if (*line)
+			line++;
+		*w = '\0';
+	}
+	return n;
+}
+
+/* Run one already-parsed command through the pager.  Returns 0 if the
+ * reference was valid but matched nothing. */
+static int run_command(const Opts *o, int argc, char **argv)
+{
+	FILE *out;
+	Ref r;
+	int i, ok = 1;
+
+	if (!o->list && !o->pat && !parse_ref(argc, argv, &r))
+		return 1;       /* message already printed; not a "no verses" case */
+
+	if (o->list)
+		for (i = 0; i < NED; i++)
+			ensure_loaded(i);
+	else
+		for (i = 0; i < norder; i++)
+			ensure_loaded(order[i]);
+
+	out = open_pager();
+	if (o->list)
+		list_books(out);
+	else if (o->pat)
+		search(out, o->pat);
+	else if (!lookup(out, &r)) {
+		ok = 0;
+	}
+	close_pager(out);
+
+	if (!ok)
+		fprintf(stderr, "hexapla: no verses found for that reference\n");
+	return 1;
+}
+
+/* ---------- welcome banner ---------- */
+
+static void pad_print(FILE *out, const char *s, int width)
+{
+	int w = disp_width(s);
+
+	fputs(s, out);
+	while (w++ < width)
+		fputc(' ', out);
+}
+
+#define PAGEW 20        /* display columns inside each page of the book */
+#define LOGOW (2 + 1 + PAGEW + 1 + PAGEW + 1)
+
+/* An open book with John 1:1 across its two pages, drawn fastfetch-style
+ * with a column of facts beside it.  The box is assembled at runtime and
+ * padded by display width so the polytonic Greek stays inside the rules. */
+static void print_logo(FILE *out)
+{
+	static const char *pgl[] = {
+		" Ἐν ἀρχῇ ἦν ὁ",
+		" λόγος, καὶ ὁ",
+		" λόγος ἦν πρὸς",
+		" τὸν θεόν",
+	};
+	static const char *pgr[] = {
+		" In principio erat",
+		" Verbum, et Verbum",
+		" erat apud Deum, et",
+		" Deus erat Verbum",
+	};
+	static const char *key[] = { "", "", "Greek", "Latin", "English", "Books" };
+	static const char *val[] = {
+		"", "",
+		"Septuagint · SBL GNT",
+		"Clementine Vulgate",
+		"Douay-Rheims",
+		"73 + 5 Septuagint-only",
+	};
+	int wide = termwidth >= LOGOW + 3 + 30;
+	int row, i;
+	char rule[64];
+
+	for (i = 0; i < PAGEW; i++)
+		rule[i] = '-';
+	rule[PAGEW] = '\0';
+
+	for (row = 0; row < 6; row++) {
+		if (row == 0)
+			fprintf(out, "  %s.%s.%s.", C_DIM, rule, rule);
+		else if (row == 5)
+			fprintf(out, "  %s'%s'%s'", C_DIM, rule, rule);
+		else {
+			fprintf(out, "  %s|%s%s", C_DIM, C_RESET,
+			        color(edcolor[ED_GRB]));
+			pad_print(out, pgl[row - 1], PAGEW);
+			fprintf(out, "%s|%s%s", C_DIM, C_RESET,
+			        color(edcolor[ED_VUL]));
+			pad_print(out, pgr[row - 1], PAGEW);
+			fprintf(out, "%s|", C_DIM);
+		}
+		fputs(C_RESET, out);
+
+		if (wide) {
+			fputs("   ", out);
+			if (row == 0)
+				fprintf(out, "%shexapla%s", C_BOLD, C_RESET);
+			else if (row == 1)
+				fprintf(out, "%sa six-column bible%s", C_DIM, C_RESET);
+			else
+				fprintf(out, "%s%-8s%s %s", C_BOLD, key[row],
+				        C_RESET, val[row]);
+		}
+		fputc('\n', out);
+	}
+	if (!wide)
+		fprintf(out, "\n  %shexapla%s - a six-column bible\n",
+		        C_BOLD, C_RESET);
+	fprintf(out, "\n  Type a reference (%sJohn 3:16%s), %s?%s for help, "
+	        "%sq%s to quit.\n\n",
+	        C_BOLD, C_RESET, C_BOLD, C_RESET, C_BOLD, C_RESET);
+}
+
+static void repl_help(void)
+{
+	static const struct { const char *cmd, *desc; } rows[] = {
+		{ "John 3:16",   "a single verse" },
+		{ "Gen 1:1-10",  "a range, and 1:31-2:2 crosses chapters" },
+		{ "Psalms 22",   "a whole chapter" },
+		{ "Jude",        "a whole book" },
+		{ "-g Matt 5:3", "pick the columns for one lookup (-g -l -e)" },
+		{ "-gle",        "set the default columns and their order" },
+		{ "-s shepherd", "search the verse text" },
+		{ "books",       "list every book and its abbreviations" },
+		{ "?",           "this help" },
+		{ "q",           "quit" },
+	};
+	size_t i;
+
+	fputc('\n', stdout);
+	for (i = 0; i < sizeof rows / sizeof rows[0]; i++)
+		printf("  %s%-13s%s %s\n", C_BOLD, rows[i].cmd, C_RESET,
+		       rows[i].desc);
+	fputs("\n  Up and down arrows walk earlier references; history is kept\n"
+	      "  between sessions.\n\n", stdout);
+}
+
+/* ---------- history ---------- */
+
+/* mkdir -p for the history file's parent directory. */
+static void mkdir_p(char *path)
+{
+	char *p;
+
+	for (p = path + 1; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		mkdir(path, 0700);
+		*p = '/';
+	}
+	mkdir(path, 0700);
+}
+
+/* $HEXAPLA_HISTFILE, else $XDG_STATE_HOME/hexapla/history, else
+ * ~/.local/state/hexapla/history.  NULL when there is nowhere to put it. */
+static const char *histfile(void)
+{
+	static char buf[PATH_MAX];
+	static int done;
+	const char *env;
+
+	if (done)
+		return buf[0] ? buf : NULL;
+	done = 1;
+
+	if ((env = getenv("HEXAPLA_HISTFILE")) && *env) {
+		snprintf(buf, sizeof buf, "%s", env);
+		return buf;
+	}
+	if ((env = getenv("XDG_STATE_HOME")) && *env)
+		snprintf(buf, sizeof buf, "%s/hexapla", env);
+	else if ((env = getenv("HOME")) && *env)
+		snprintf(buf, sizeof buf, "%s/.local/state/hexapla", env);
+	else
+		return NULL;
+	mkdir_p(buf);
+	strncat(buf, "/history", sizeof buf - strlen(buf) - 1);
+	return buf;
+}
+
+#ifdef HAVE_READLINE
+
+static void hist_load(void)
+{
+	static int done;
+	const char *f = histfile();
+
+	if (done)
+		return;
+	done = 1;
+	using_history();
+	if (f)
+		read_history(f);
+}
+
+/* Record a line, skipping blanks and immediate repeats. */
+static void hist_add(const char *line)
+{
+	HIST_ENTRY *last;
+
+	while (*line == ' ')
+		line++;
+	if (!*line)
+		return;
+	last = history_get(history_base + history_length - 1);
+	if (last && strcmp(last->line, line) == 0)
+		return;
+	add_history(line);
+}
+
+static void hist_save(void)
+{
+	const char *f = histfile();
+
+	if (!f)
+		return;
+	if (append_history(1, f) != 0)
+		write_history(f);
+	history_truncate_file(f, HISTMAX);
+}
+
+static char *read_line(const char *prompt)
+{
+	return readline(prompt);
+}
+
+#else /* no readline: history still persists, but without arrow keys */
+
+static void hist_load(void) {}
+
+static void hist_add(const char *line)
+{
+	const char *f = histfile();
+	FILE *h;
+
+	while (*line == ' ')
+		line++;
+	if (!*line || !f || !(h = fopen(f, "a")))
+		return;
+	fprintf(h, "%s\n", line);
+	fclose(h);
+}
+
+static void hist_save(void) {}
+
+static char *read_line(const char *prompt)
+{
+	char buf[512];
+	size_t n;
+
+	fputs(prompt, stdout);
+	fflush(stdout);
+	if (!fgets(buf, sizeof buf, stdin))
+		return NULL;
+	n = strlen(buf);
+	if (n && buf[n - 1] == '\n')
+		buf[n - 1] = '\0';
+	return strdup(buf);
+}
+
+#endif
+
+/* ---------- interactive prompt ---------- */
+
+static int is_word(const char *s, const char *word)
+{
+	return strcasecmp(s, word) == 0;
+}
+
+/* readline needs non-printing bytes bracketed by \001..\002 to keep its
+ * idea of the cursor column right. */
+static const char *prompt_str(void)
+{
+	static char buf[64];
+
+	if (!use_color)
+		return "hexapla> ";
+	snprintf(buf, sizeof buf, "\001\033[1;36m\002hexapla\001\033[0m\002> ");
+	return buf;
+}
+
+static void repl(void)
+{
+	hist_load();
+
+	for (;;) {
+		char *line = read_line(prompt_str());
+		char *argv[32], whole[512];
+		Opts o = { 0 };
+		char patbuf[512];
+		int argc, first;
+
+		if (!line) {             /* EOF (ctrl-D) */
+			fputc('\n', stdout);
+			break;
+		}
+		/* split_line() cuts the line into tokens in place, so keep the
+		 * text the user actually typed for the history */
+		snprintf(whole, sizeof whole, "%s", line);
+		argc = split_line(line, argv, 32);
+		if (argc == 0) {
+			free(line);
+			continue;
+		}
+		if (is_word(argv[0], "q") || is_word(argv[0], "quit") ||
+		    is_word(argv[0], "exit") || is_word(argv[0], ":q")) {
+			free(line);
+			break;
+		}
+		hist_add(whole);
+		if (is_word(argv[0], "?") || is_word(argv[0], "help")) {
+			repl_help();
+			free(line);
+			continue;
+		}
+		if (is_word(argv[0], "books")) {
+			o.list = 1;
+			argc = 0;
+		}
+
+		/* Flags on a command apply to that command only; a line of
+		 * nothing but language flags sets the session default. */
+		norder = 0;
+		first = o.list ? 0 : parse_flags(argc, argv, &o, patbuf, sizeof patbuf);
+		if (first < 0) {
+			free(line);
+			continue;
+		}
+		if (o.help) {
+			repl_help();
+			free(line);
+			continue;
+		}
+		if (norder && !o.list && !o.pat && first >= argc) {
+			memcpy(deforder, order, sizeof order);
+			defnorder = norder;
+			printf("  columns:");
+			for (int i = 0; i < norder; i++)
+				printf(" %s%s%s", color(edcolor[order[i]]),
+				       order[i] == ED_GRB ? "Greek" :
+				       order[i] == ED_VUL ? "Latin" : "English",
+				       C_RESET);
+			printf("\n");
+			free(line);
+			continue;
+		}
+		if (!norder) {
+			memcpy(order, deforder, sizeof order);
+			norder = defnorder;
+		}
+		if (!o.list && !o.pat && first >= argc) {
+			free(line);
+			continue;
+		}
+		run_command(&o, argc - first, argv + first);
+		free(line);
+	}
+	hist_save();
+}
+
 /* ---------- main ---------- */
 
 static void usage(void)
 {
-	fputs("usage: hexapla [-gle] book [chapter[:verse[-verse]]]\n"
+	fputs("usage: hexapla [-gle] [book [chapter[:verse[-verse]]]]\n"
 	      "       hexapla [-gle] -s pattern\n"
 	      "       hexapla -L\n"
 	      "\n"
@@ -514,6 +1041,12 @@ static void usage(void)
 	      "      -eg shows English then Greek (default: all three)\n"
 	      "  -s  search verse text for a pattern\n"
 	      "  -L  list books and the editions each is available in\n"
+	      "  -1  print once and exit instead of staying at the prompt\n"
+	      "\n"
+	      "With no reference, or after one is shown, hexapla stays at an\n"
+	      "interactive prompt: type another reference, use the up arrow to\n"
+	      "recall earlier ones, or 'q' to quit.  Output is not interactive\n"
+	      "when it is piped or redirected.\n"
 	      "\n"
 	      "Set HEXAPLA_LANGS (e.g. 'gl' or 'elg') to change the default\n"
 	      "columns and order; command-line flags override it.\n"
@@ -531,23 +1064,21 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-	int opt, list = 0, i, ed;
-	const char *pat = NULL, *dir;
-	FILE *out = stdout;
-	Ref r;
+	Opts o = { 0 };
+	char patbuf[512];
+	int first, interactive, ed;
 
 	setlocale(LC_ALL, "");
+	signal(SIGPIPE, SIG_IGN);
 
-	while ((opt = getopt(argc, argv, "gleLs:h")) != -1) {
-		switch (opt) {
-		case 'g': add_lang(ED_GRB); break;
-		case 'l': add_lang(ED_VUL); break;
-		case 'e': add_lang(ED_DRB); break;
-		case 'L': list = 1; break;
-		case 's': pat = optarg; break;
-		default: usage();
-		}
-	}
+	first = parse_flags(argc - 1, argv + 1, &o, patbuf, sizeof patbuf);
+	if (first < 0)
+		return 1;
+	if (o.help)
+		usage();
+	argc -= first + 1;
+	argv += first + 1;
+
 	if (!norder) {
 		const char *s = getenv("HEXAPLA_LANGS");
 		for (; s && *s; s++)
@@ -563,10 +1094,8 @@ int main(int argc, char **argv)
 	if (!norder)
 		for (ed = 0; ed < NED; ed++)
 			add_lang(ed);
-	argc -= optind;
-	argv += optind;
-	if (!list && !pat && argc == 0)
-		usage();
+	memcpy(deforder, order, sizeof order);
+	defnorder = norder;
 
 	use_color = isatty(STDOUT_FILENO);
 	if (use_color) {
@@ -574,33 +1103,39 @@ int main(int argc, char **argv)
 		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
 			termwidth = ws.ws_col;
 	}
+	interactive = use_color && isatty(STDIN_FILENO) && !o.once;
 
-	if (!list && !pat && !parse_ref(argc, argv, &r))
-		return 1;
+	/* Nothing to show and nowhere to prompt: explain and stop. */
+	if (!interactive && !o.list && !o.pat && argc == 0)
+		usage();
 
-	dir = datadir();
-	if (list)
-		for (ed = 0; ed < NED; ed++)
-			load_edition(ed, dir);
-	else
-		for (i = 0; i < norder; i++)
-			load_edition(order[i], dir);
+	datapath = datadir();
 
-	if (use_color) {
-		const char *pager = getenv("PAGER");
-		FILE *pg = popen(pager && *pager ? pager : "less -FRX", "w");
-		if (pg)
-			out = pg;
+	if (o.list || o.pat || argc > 0) {
+		run_command(&o, argc, argv);
+		if (interactive) {
+			/* the reference typed on the command line is worth
+			 * recalling at the prompt too */
+			char joined[256] = "";
+			int i;
+			for (i = 0; i < argc; i++) {
+				if (joined[0])
+					strncat(joined, " ",
+					        sizeof joined - strlen(joined) - 1);
+				strncat(joined, argv[i],
+				        sizeof joined - strlen(joined) - 1);
+			}
+			hist_load();
+			if (joined[0])
+				hist_add(joined);
+			fprintf(stdout, "\n  %s?%s for help, %sq%s to quit.\n",
+			        C_BOLD, C_RESET, C_BOLD, C_RESET);
+		}
+	} else if (interactive) {
+		print_logo(stdout);
 	}
 
-	if (list)
-		list_books(out);
-	else if (pat)
-		search(out, pat);
-	else if (!lookup(out, &r))
-		fprintf(stderr, "hexapla: no verses found for that reference\n");
-
-	if (out != stdout)
-		pclose(out);
+	if (interactive)
+		repl();
 	return 0;
 }
