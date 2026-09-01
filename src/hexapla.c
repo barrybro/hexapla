@@ -86,6 +86,67 @@ static void die(const char *msg)
 	exit(1);
 }
 
+/* ---------- UTF-8 ---------- */
+
+/* Decode one UTF-8 sequence and return the bytes consumed.  The data files
+ * are always UTF-8, so decoding them here keeps the layout correct whatever
+ * locale the caller happens to be in; mbrtowc would fall back to single
+ * bytes under LANG=C and mis-measure every Greek and accented Latin word.
+ * Malformed bytes are consumed one at a time as U+FFFD so we always advance. */
+static int utf8_decode(const char *s, unsigned *cp)
+{
+	const unsigned char *u = (const unsigned char *)s;
+	unsigned c = u[0];
+	int len, i;
+
+	if (c < 0x80) {
+		*cp = c;
+		return 1;
+	} else if ((c & 0xe0) == 0xc0) {
+		c &= 0x1f;
+		len = 2;
+	} else if ((c & 0xf0) == 0xe0) {
+		c &= 0x0f;
+		len = 3;
+	} else if ((c & 0xf8) == 0xf0) {
+		c &= 0x07;
+		len = 4;
+	} else {
+		*cp = 0xfffd;
+		return 1;
+	}
+
+	for (i = 1; i < len; i++) {
+		if ((u[i] & 0xc0) != 0x80) {
+			*cp = 0xfffd;
+			return 1;
+		}
+		c = (c << 6) | (u[i] & 0x3f);
+	}
+	*cp = c;
+	return len;
+}
+
+/* Encode one codepoint, returning the bytes written.  Only the one to
+ * three byte forms are needed: every codepoint this writes is a
+ * normalization target below U+FFFF. */
+static int utf8_encode(char *out, unsigned cp)
+{
+	if (cp < 0x80) {
+		out[0] = (char)cp;
+		return 1;
+	}
+	if (cp < 0x800) {
+		out[0] = (char)(0xc0 | (cp >> 6));
+		out[1] = (char)(0x80 | (cp & 0x3f));
+		return 2;
+	}
+	out[0] = (char)(0xe0 | (cp >> 12));
+	out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+	out[2] = (char)(0x80 | (cp & 0x3f));
+	return 3;
+}
+
 /* ---------- data loading ---------- */
 
 static const char *datadir(void)
@@ -138,6 +199,77 @@ static void strip_sigla(char *s)
 			continue;
 		}
 		*w++ = *s++;
+	}
+	*w = '\0';
+}
+
+/* grb.tsv is two upstream texts joined end to end, and they disagree on
+ * how to spell an accent: the Septuagint half uses the Greek Extended
+ * "oxia" characters, the SBL New Testament half the canonically
+ * equivalent "tonos" ones.  They render identically but differ in bytes,
+ * so a search for a word spelled one way silently skipped every verse
+ * that spelled it the other -- searching for kuriou found 228 verses
+ * while missing Genesis 6:8, which plainly contains it.
+ *
+ * These are exactly the canonical singleton decompositions of the two
+ * Greek blocks, i.e. NFC.  Normalizing the text on load and the pattern
+ * before matching makes the corpus internally consistent and lets either
+ * spelling find both halves.  The corpus has no combining marks, so
+ * these singletons are all that NFC needs here. */
+static const struct { unsigned from, to; } greek_nfc[] = {
+	{ 0x0374, 0x02B9 },  /* GREEK NUMERAL SIGN */
+	{ 0x037E, 0x003B },  /* GREEK QUESTION MARK */
+	{ 0x0387, 0x00B7 },  /* GREEK ANO TELEIA */
+	{ 0x1F71, 0x03AC },  /* SMALL ALPHA WITH OXIA */
+	{ 0x1F73, 0x03AD },  /* SMALL EPSILON WITH OXIA */
+	{ 0x1F75, 0x03AE },  /* SMALL ETA WITH OXIA */
+	{ 0x1F77, 0x03AF },  /* SMALL IOTA WITH OXIA */
+	{ 0x1F79, 0x03CC },  /* SMALL OMICRON WITH OXIA */
+	{ 0x1F7B, 0x03CD },  /* SMALL UPSILON WITH OXIA */
+	{ 0x1F7D, 0x03CE },  /* SMALL OMEGA WITH OXIA */
+	{ 0x1FBB, 0x0386 },  /* CAPITAL ALPHA WITH OXIA */
+	{ 0x1FBE, 0x03B9 },  /* GREEK PROSGEGRAMMENI */
+	{ 0x1FC9, 0x0388 },  /* CAPITAL EPSILON WITH OXIA */
+	{ 0x1FCB, 0x0389 },  /* CAPITAL ETA WITH OXIA */
+	{ 0x1FD3, 0x0390 },  /* SMALL IOTA WITH DIALYTIKA AND OXIA */
+	{ 0x1FDB, 0x038A },  /* CAPITAL IOTA WITH OXIA */
+	{ 0x1FE3, 0x03B0 },  /* SMALL UPSILON WITH DIALYTIKA AND OXIA */
+	{ 0x1FEB, 0x038E },  /* CAPITAL UPSILON WITH OXIA */
+	{ 0x1FEE, 0x0385 },  /* GREEK DIALYTIKA AND OXIA */
+	{ 0x1FEF, 0x0060 },  /* GREEK VARIA */
+	{ 0x1FF9, 0x038C },  /* CAPITAL OMICRON WITH OXIA */
+	{ 0x1FFB, 0x038F },  /* CAPITAL OMEGA WITH OXIA */
+	{ 0x1FFD, 0x00B4 },  /* GREEK OXIA */
+};
+
+/* Rewrite s in place into NFC.  Every mapping above is the same length or
+ * shorter in UTF-8 (a 3-byte Greek Extended character becoming a 2-byte
+ * one), so the result always fits.  Unmapped text is copied through as
+ * raw bytes rather than re-encoded, because re-encoding would turn a
+ * malformed byte into a 3-byte U+FFFD and overrun. */
+static void normalize_greek(char *s)
+{
+	char *w = s;
+
+	while (*s) {
+		unsigned cp;
+		int len = utf8_decode(s, &cp);
+		size_t k;
+
+		/* every mapped codepoint lives in one of these two spans, so
+		 * ordinary Greek letters skip the search entirely */
+		if ((cp >= 0x0374 && cp <= 0x0387) ||
+		    (cp >= 0x1F71 && cp <= 0x1FFD)) {
+			for (k = 0; k < sizeof greek_nfc / sizeof greek_nfc[0]; k++)
+				if (greek_nfc[k].from == cp) {
+					w += utf8_encode(w, greek_nfc[k].to);
+					goto next;
+				}
+		}
+		memmove(w, s, len);
+		w += len;
+next:
+		s += len;
 	}
 	*w = '\0';
 }
@@ -221,8 +353,10 @@ static void load_edition(int ed, const char *dir)
 			verse = atoi(fields[4]);
 			text = fields[5];
 		}
-		if (ed == ED_GRB)
+		if (ed == ED_GRB) {
 			strip_sigla(text);
+			normalize_greek(text);
+		}
 		addverse(e, book, chap + choff, verse, text);
 	}
 }
@@ -240,45 +374,6 @@ static void ensure_loaded(int ed)
 }
 
 /* ---------- output ---------- */
-
-/* Decode one UTF-8 sequence and return the bytes consumed.  The data files
- * are always UTF-8, so decoding them here keeps the layout correct whatever
- * locale the caller happens to be in; mbrtowc would fall back to single
- * bytes under LANG=C and mis-measure every Greek and accented Latin word.
- * Malformed bytes are consumed one at a time as U+FFFD so we always advance. */
-static int utf8_decode(const char *s, unsigned *cp)
-{
-	const unsigned char *u = (const unsigned char *)s;
-	unsigned c = u[0];
-	int len, i;
-
-	if (c < 0x80) {
-		*cp = c;
-		return 1;
-	} else if ((c & 0xe0) == 0xc0) {
-		c &= 0x1f;
-		len = 2;
-	} else if ((c & 0xf0) == 0xe0) {
-		c &= 0x0f;
-		len = 3;
-	} else if ((c & 0xf8) == 0xf0) {
-		c &= 0x07;
-		len = 4;
-	} else {
-		*cp = 0xfffd;
-		return 1;
-	}
-
-	for (i = 1; i < len; i++) {
-		if ((u[i] & 0xc0) != 0x80) {
-			*cp = 0xfffd;
-			return 1;
-		}
-		c = (c << 6) | (u[i] & 0x3f);
-	}
-	*cp = c;
-	return len;
-}
 
 /* Combining marks and zero-width formatting characters sit on the preceding
  * character and occupy no column of their own.  Everything these texts
@@ -727,7 +822,7 @@ static int split_line(char *line, char **argv, int max)
 static int run_command(const Opts *o, int argc, char **argv)
 {
 	FILE *out;
-	Ref r;
+	Ref r = { 0 };  /* only read on the lookup path, where parse_ref filled it */
 	int i, ok = 1;
 
 	if (!o->list && !o->pat && !parse_ref(argc, argv, &r))
@@ -741,11 +836,17 @@ static int run_command(const Opts *o, int argc, char **argv)
 			ensure_loaded(order[i]);
 
 	out = open_pager();
-	if (o->list)
+	if (o->list) {
 		list_books(out);
-	else if (o->pat)
-		search(out, o->pat);
-	else if (!lookup(out, &r)) {
+	} else if (o->pat) {
+		/* the corpus is stored in NFC, so the pattern must match in
+		 * NFC too or Greek typed the other way would never be found */
+		char pat[512];
+
+		snprintf(pat, sizeof pat, "%s", o->pat);
+		normalize_greek(pat);
+		search(out, pat);
+	} else if (!lookup(out, &r)) {
 		ok = 0;
 	}
 	close_pager(out);
@@ -845,12 +946,17 @@ static void repl_help(void)
 		{ "John 3:16",   "a single verse" },
 		{ "Gen 1:1-10",  "a range; 1:31-2:2 crosses chapters" },
 		{ "Psalms 22",   "a whole chapter" },
+		{ "Gen 1-3",     "a range of chapters" },
 		{ "Jude",        "a whole book" },
 		{ NULL,          NULL },
 		{ "-g Matt 5:3", "columns for one lookup: -g Greek, -l Latin," },
 		{ "",            "-e English; -el is English then Latin" },
 		{ "-el",         "on its own, sets the columns for the session" },
-		{ "-s shepherd", "search the verse text; no quoting needed" },
+		{ NULL,          NULL },
+		{ "-s shepherd", "search all shown columns; no quoting needed" },
+		{ "-e -s mercy", "search one language only -- -s looks at just" },
+		{ "",            "the columns shown, so -g/-l/-e scope it" },
+		{ NULL,          NULL },
 		{ "-p Gen 1",    "one verse per line, tab separated, unwrapped" },
 		{ "-w 60",       "wrap to a fixed width for this lookup" },
 		{ NULL,          NULL },
@@ -1111,17 +1217,45 @@ static void usage(FILE *out, int status)
 	      "Look up Bible verses in Greek (Septuagint / SBL Greek NT), Latin\n"
 	      "(Clementine Vulgate) and English (Douay-Rheims) side by side.\n"
 	      "\n"
-	      "columns:\n"
-	      "  -g -l -e     Greek, Latin, English.  Combine them to choose the\n"
-	      "               columns and their order: -eg is English then Greek.\n"
-	      "               The default is all three, Greek first.\n"
+	      "reference (the arguments that are not options):\n"
+	      "  book             a whole book:              Jude\n"
+	      "  book C           a whole chapter:           Psalms 22\n"
+	      "  book C-C         a range of chapters:       Gen 1-3\n"
+	      "  book C:V         a single verse:            John 3:16\n"
+	      "  book C:V-V       verses within a chapter:   Matt 5:3-12\n"
+	      "  book C:V-C:V     a range across chapters:   Gen 1:31-2:2\n"
+	      "               The book may be several words ('1 Cor'), and spaces\n"
+	      "               and dots are ignored, so 1Cor and 1 Cor. are the\n"
+	      "               same.  Abbreviations and any unique prefix of a name\n"
+	      "               work too: Deut, Apoc, Sirach.  -L lists them all.\n"
+	      "\n"
+	      "columns, and which languages -s searches:\n"
+	      "  -g           Greek   (Septuagint, and the SBL Greek NT)\n"
+	      "  -l           Latin   (Clementine Vulgate)\n"
+	      "  -e           English (Douay-Rheims)\n"
+	      "               Combine them to choose the columns and their order:\n"
+	      "               -eg shows English then Greek.  The default is all\n"
+	      "               three, Greek first.\n"
+	      "               These also scope a search, because -s only looks at\n"
+	      "               the columns being shown.  So 'hexapla -e -s mercy'\n"
+	      "               searches the English alone, and 'hexapla -l -s\n"
+	      "               dominus' the Latin alone.  Without one of these,\n"
+	      "               -s searches all three.\n"
 	      "\n"
 	      "what to show:\n"
-	      "  -s pattern   search the verse text.  Takes the rest of the line,\n"
-	      "               so the pattern needs no quoting.  Greek search is\n"
-	      "               byte-exact: match accents and case\n"
+	      "  -s pattern   search verse text for a substring, rather than\n"
+	      "               looking up a reference.  Takes the rest of the line,\n"
+	      "               so the pattern needs no quoting: -s vale of tears.\n"
+	      "               Use -g/-l/-e above to search one language only.\n"
+	      "               Matching ignores case for ASCII.  Greek is matched\n"
+	      "               accent for accent, but both the text and the pattern\n"
+	      "               are put into Unicode NFC first, so it does not matter\n"
+	      "               which of two identical-looking accent characters you\n"
+	      "               type.  Searches the whole bible -- to scope\n"
+	      "               one to a book or chapter, pipe -p output to grep:\n"
+	      "                 hexapla -pe Gen 2 | grep -i 'the lord'\n"
 	      "  -L           list every book, the editions it appears in, and\n"
-	      "               the abbreviations accepted for it\n"
+	      "               every abbreviation accepted for it\n"
 	      "\n"
 	      "output:\n"
 	      "  -p           one whole verse per line, tab separated and never\n"
@@ -1133,9 +1267,10 @@ static void usage(FILE *out, int status)
 	      "               something is parsing the fields\n"
 	      "  -w cols      wrap to this width instead of the terminal's\n"
 	      "               (minimum 20).  -w60 and -w 60 both work\n"
-	      "  -1           print once and exit instead of staying at the\n"
-	      "               prompt\n"
-	      "  -h           this help\n"
+	      "  -1           print the result and exit instead of staying at\n"
+	      "               the prompt.  Piped or redirected output does this\n"
+	      "               anyway; -1 is for when you want it on a terminal\n"
+	      "  -h           show this help and exit\n"
 	      "\n"
 	      "the prompt:\n"
 	      "  With no reference -- or after one is shown -- hexapla stays at an\n"
@@ -1161,7 +1296,13 @@ static void usage(FILE *out, int status)
 	      "  hexapla Jude                 a whole book\n"
 	      "  hexapla -g Matt 5:3-12       Greek only\n"
 	      "  hexapla -el 1 Cor 13         English then Latin\n"
-	      "  hexapla -s vale of tears     search every column\n"
+	      "\n"
+	      "  hexapla -s vale of tears     search all three languages\n"
+	      "  hexapla -e -s mercy          search the English only\n"
+	      "  hexapla -l -s dominus        search the Latin only\n"
+	      "  hexapla -es mercy            the same, flags bundled\n"
+	      "  hexapla -pe Gen 2 | grep -i 'the lord'\n"
+	      "                               search within one chapter\n"
 	      "  hexapla -pe Psalms | fzf | cut -f1 | xargs hexapla\n"
 	      "                               fuzzy-find a psalm, then read it\n"
 	      "                               in all three languages\n"

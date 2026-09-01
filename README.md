@@ -34,8 +34,12 @@ hexapla -L
 - `hexapla -g Matt 5:3-12` — choose languages (`-g` Greek, `-l` Latin,
   `-e` English); flags combine, and their order sets the column order
   (`-eg` shows English then Greek)
-- `hexapla -s 'vale of tears'` — search verse text (Greek search is
-  byte-exact: match accents and case)
+- `hexapla -s 'vale of tears'` — search verse text. The language flags
+  scope the search, because `-s` only looks at the columns being shown:
+  `hexapla -e -s mercy` searches the English alone, `hexapla -l -s
+  dominus` the Latin. Greek is matched accent for accent, but text and
+  pattern are both normalized to Unicode NFC first, so it does not
+  matter which of two identical-looking accent characters you type
 - `hexapla -L` — list all books, the editions each is available in, and
   accepted abbreviations
 

@@ -67,6 +67,36 @@ absorbs those inconsistencies (BOM stripping, a duplicated Genesis 1:1
 row in `grb.tsv`, SBLGNT critical sigla stripped from Greek text) so
 the rest of the program can treat all three editions uniformly.
 
+### Greek Unicode normalization
+
+`grb.tsv` is two upstream texts concatenated, and they disagree on how to
+spell an accent: the **Septuagint half uses Greek Extended "oxia"**
+characters (U+1F71, U+1F77, …) while the **SBL New Testament half uses
+the canonically equivalent "tonos"** ones (U+03AC, U+03AF, …). These
+render identically but differ in bytes, so before this was fixed a
+search matched one half of the bible and silently skipped the other —
+`κυρίου` found 228 verses while missing Genesis 6:8, which plainly
+contains it.
+
+`normalize_greek()` maps text to NFC on load (and `run_command()` applies
+it to the `-s` pattern) using `greek_nfc[]`, the canonical singleton
+decompositions of the two Greek blocks. Both must stay in sync: **the
+pattern has to be normalized wherever the corpus is**, or Greek typed the
+other way silently fails again.
+
+Facts that make this approach sound, worth rechecking if the data is ever
+updated: the corpus contains **no combining marks**, so singleton mapping
+is all NFC requires (no decomposition/recomposition pass); and every
+mapping is same-length-or-shorter in UTF-8 (3-byte Greek Extended → 2-byte
+Greek), so it rewrites safely in place like `strip_sigla`. `vul.tsv` and
+`drb.tsv` are already pure NFC and are left alone.
+
+To re-verify after a data update, compare against Python's Unicode tables:
+
+```sh
+./hexapla -pg -s ε | python3 -c 'import sys,unicodedata as u; t=sys.stdin.read(); print(u.normalize("NFC",t)==t)'
+```
+
 ### Septuagint/Vulgate book folding
 
 `grb.tsv` (Greek) splits some texts that the Vulgate tradition treats
