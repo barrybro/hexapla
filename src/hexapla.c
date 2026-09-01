@@ -545,24 +545,58 @@ static int parse_spec(const char *s, Ref *r)
 	return r->from <= r->to;
 }
 
+/* Join the arguments and split the result into a book and an optional
+ * chapter/verse spec.  Splitting the joined string rather than trusting
+ * the shell's word boundaries means it no longer matters how the
+ * reference was quoted: "John 3:16" as one argument works as well as two,
+ * and John3:16 works with no space at all.  The spec is the trailing run
+ * of digits and the punctuation a spec can contain; no book name ends in
+ * a digit, so this never eats part of one ("1 John" keeps its 1). */
 static int parse_ref(int argc, char **argv, Ref *r)
 {
 	char query[256] = "", norm[256];
-	int i, nbook = argc;
+	int i;
+	size_t len, cut;
 
-	r->from = 0;
-	r->to = LONG_MAX;
-	if (argc > 1 && parse_spec(argv[argc - 1], r))
-		nbook = argc - 1;
-	for (i = 0; i < nbook; i++) {
+	for (i = 0; i < argc; i++) {
 		if (i)
 			strncat(query, " ", sizeof query - strlen(query) - 1);
 		strncat(query, argv[i], sizeof query - strlen(query) - 1);
 	}
+
+	r->from = 0;
+	r->to = LONG_MAX;
+
+	len = strlen(query);
+	for (cut = len; cut > 0; cut--) {
+		char c = query[cut - 1];
+		if (!isdigit((unsigned char)c) && c != ':' && c != '-')
+			break;
+	}
+	/* cut > 0 keeps a bare "22" from being read as a spec with no book */
+	if (cut > 0 && cut < len) {
+		char book[256];
+		Ref split = { 0 };
+
+		memcpy(book, query, cut);
+		book[cut] = '\0';
+		if (parse_spec(query + cut, &split)) {
+			normalize(book, norm, sizeof norm);
+			r->book = book_find(norm);
+			if (r->book >= 0) {
+				r->from = split.from;
+				r->to = split.to;
+				return 1;
+			}
+		}
+	}
+
+	/* no spec, or the part before it named no book: try the whole thing */
 	normalize(query, norm, sizeof norm);
 	r->book = book_find(norm);
 	if (r->book < 0) {
-		fprintf(stderr, "hexapla: unknown book '%s'\n", query);
+		fprintf(stderr, "hexapla: unknown book '%s'"
+		        " (see 'hexapla -L' for the list)\n", query);
 		return 0;
 	}
 	return 1;
@@ -1228,6 +1262,9 @@ static void usage(FILE *out, int status)
 	      "               and dots are ignored, so 1Cor and 1 Cor. are the\n"
 	      "               same.  Abbreviations and any unique prefix of a name\n"
 	      "               work too: Deut, Apoc, Sirach.  -L lists them all.\n"
+	      "               Quoting makes no difference: \"John 3:16\" as one\n"
+	      "               argument, John 3:16 as two, and John3:16 with no\n"
+	      "               space are all read the same way.\n"
 	      "\n"
 	      "columns, and which languages -s searches:\n"
 	      "  -g           Greek   (Septuagint, and the SBL Greek NT)\n"

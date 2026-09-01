@@ -139,6 +139,14 @@ characters are counted as zero-width.
   when no flags are given; default is all three in GRB/VUL/DRB order.
 - Reference grammar (`parse_spec`): `C`, `C-C`, `C:V`, `C:V-V`,
   `C:V-C:V`.
+- `parse_ref()` joins all the arguments and then splits the *string*,
+  rather than trusting the shell's word boundaries, so quoting cannot
+  change the meaning: `"John 3:16"`, `John 3:16` and `John3:16` all
+  parse. It finds the spec by walking back over the trailing run of
+  digits, `:` and `-`. This is safe only because **no book name ends in
+  a digit** — if one ever did, `1 John 2` would lose its chapter. It
+  also requires a non-empty book part, so a bare `22` stays an error
+  rather than becoming a chapter of nothing.
 - Output is piped through `$PAGER` (default `less -FRX`) when stdout is
   a terminal; color is enabled only when stdout is a terminal.
 - `parse_flags()` is hand-rolled rather than getopt so the command line
