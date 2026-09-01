@@ -115,6 +115,24 @@ characters are counted as zero-width.
   and the interactive prompt accept exactly the same syntax. `-s`
   deliberately swallows the rest of the line as its pattern, so search
   phrases need no quoting when typed at the prompt.
+- Three output concerns are deliberately separate globals, and conflating
+  them breaks a real case: `is_tty` gates paging and the prompt,
+  `use_color` gates escapes (`is_tty` **or** forced by `-C`), and
+  `plain` gates the record format. If `open_pager()` keyed off
+  `use_color`, then `-C` into a pipe would spawn a pager into that pipe
+  and hang.
+
+### Line-oriented output (-p)
+
+`print_plain()` emits `Book C:V<TAB>TAG<TAB>text`, one whole unwrapped
+verse per line, for `fzf`/`grep`/`awk`/`cut`. Invariants worth keeping:
+
+- The reference is the first field and is formatted exactly as
+  `parse_ref()` accepts it, so `... | cut -f1 | xargs hexapla` round
+  trips. Don't pad or decorate it.
+- Missing-verse placeholder rows (`—`) are suppressed under `-p`; a
+  record format should not carry rows with no text.
+- `-p` implies one-shot, so it never drops into the prompt.
 
 ### Interactive prompt
 

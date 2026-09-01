@@ -52,7 +52,9 @@ static const char *edfile[NED]  = { "grb.tsv", "vul.tsv", "drb.tsv" };
 static const char *edlabel[NED] = { "LXX", "VUL", "DRB" };
 static const char *edcolor[NED] = { "\033[36m", "\033[33m", "\033[32m" };
 
-static int use_color;
+static int is_tty;      /* stdout is a terminal: controls paging and the prompt */
+static int use_color;   /* is_tty, or forced on with -C for 'fzf --ansi' */
+static int plain;       /* -p: one verse per line, tab separated */
 static int termwidth = 80;
 
 /* active editions, in the order their columns are displayed */
@@ -363,6 +365,19 @@ static const char *greek_label(int book)
 	return books[book].nt ? "GNT" : "LXX";
 }
 
+/* One whole verse per line, "Book C:V<TAB>TAG<TAB>text", never wrapped.
+ * Line-oriented tools -- fzf, grep, awk, cut -- work a line at a time, so
+ * the human layout (a reference above its wrapped columns) gives them
+ * fragments with no reference attached.  Keeping the reference first and
+ * unpadded means a selected line feeds straight back into hexapla. */
+static void print_plain(FILE *out, int book, int chap, int verse, int ed,
+                        const char *text)
+{
+	fprintf(out, "%s%s %d:%d%s\t%s%s%s\t%s\n",
+	        C_BOLD, books[book].display, chap, verse, C_RESET,
+	        color(edcolor[ed]), edlabel[ed], C_RESET, text);
+}
+
 /* ---------- paging ---------- */
 
 /* The pager gets its own process; quitting it early (q in less) leaves us
@@ -374,7 +389,7 @@ static FILE *open_pager(void)
 	const char *pager;
 	FILE *pg;
 
-	if (!use_color)
+	if (!is_tty)
 		return stdout;
 	pager = getenv("PAGER");
 	pg = popen(pager && *pager ? pager : "less -FRX", "w");
@@ -499,20 +514,27 @@ static int lookup(FILE *out, const Ref *r)
 		if (key == LONG_MAX)
 			break;
 
-		if (printed)
-			fputc('\n', out);
-		fprintf(out, "%s%s %d:%d%s\n", C_BOLD, books[r->book].display,
-		        chap, verse, C_RESET);
+		if (!plain) {
+			if (printed)
+				fputc('\n', out);
+			fprintf(out, "%s%s %d:%d%s\n", C_BOLD,
+			        books[r->book].display, chap, verse, C_RESET);
+		}
 		for (i = 0; i < norder; i++) {
 			ed = order[i];
 			if (in_range(&eds[ed], idx[ed], r) &&
 			    KEY(eds[ed].v[idx[ed]].chap, eds[ed].v[idx[ed]].verse) == key) {
 				edlabel[ED_GRB] = greek_label(r->book);
-				print_verse_line(out, ed, eds[ed].v[idx[ed]].text);
+				if (plain)
+					print_plain(out, r->book, chap, verse, ed,
+					            eds[ed].v[idx[ed]].text);
+				else
+					print_verse_line(out, ed, eds[ed].v[idx[ed]].text);
 				while (in_range(&eds[ed], idx[ed], r) &&
 				       KEY(eds[ed].v[idx[ed]].chap, eds[ed].v[idx[ed]].verse) == key)
 					idx[ed]++;
-			} else if (eds[ed].hasbook[r->book]) {
+			} else if (!plain && eds[ed].hasbook[r->book]) {
+				/* a placeholder row is for reading, not for piping */
 				print_verse_line(out, ed, NULL);
 			}
 		}
@@ -537,10 +559,16 @@ static void search(FILE *out, const char *pat)
 			if (!strcasestr(v->text, pat))
 				continue;
 			edlabel[ED_GRB] = greek_label(v->book);
-			fprintf(out, "%s%s %d:%d%s\n", C_BOLD,
-			        books[v->book].display, v->chap, v->verse, C_RESET);
-			print_verse_line(out, ed, v->text);
-			fputc('\n', out);
+			if (plain) {
+				print_plain(out, v->book, v->chap, v->verse, ed,
+				            v->text);
+			} else {
+				fprintf(out, "%s%s %d:%d%s\n", C_BOLD,
+				        books[v->book].display, v->chap,
+				        v->verse, C_RESET);
+				print_verse_line(out, ed, v->text);
+				fputc('\n', out);
+			}
 			if (ferror(out))
 				return;
 		}
@@ -551,6 +579,22 @@ static void list_books(FILE *out)
 {
 	int i, ed;
 
+	if (plain) {
+		for (i = 0; i < nbooks; i++) {
+			int first = 1;
+
+			fprintf(out, "%s\t", books[i].display);
+			for (ed = 0; ed < NED; ed++) {
+				edlabel[ED_GRB] = greek_label(i);
+				if (!eds[ed].hasbook[i])
+					continue;
+				fprintf(out, "%s%s", first ? "" : ",", edlabel[ed]);
+				first = 0;
+			}
+			fprintf(out, "\t%s\n", books[i].aliases);
+		}
+		return;
+	}
 	for (i = 0; i < nbooks; i++) {
 		fprintf(out, "%s%-24s%s ", C_BOLD, books[i].display, C_RESET);
 		for (ed = 0; ed < NED; ed++) {
@@ -571,6 +615,8 @@ typedef struct {
 	int list;               /* -L */
 	int once;               /* -1 */
 	int help;               /* -h */
+	int forcecolor;         /* -C */
+	int width;              /* -w */
 	const char *pat;        /* -s */
 } Opts;
 
@@ -596,6 +642,21 @@ static int parse_flags(int argc, char **argv, Opts *o, char *patbuf, size_t pats
 			case 'L': o->list = 1; break;
 			case '1': o->once = 1; break;
 			case 'h': o->help = 1; break;
+			case 'p': plain = 1; break;
+			case 'C': o->forcecolor = 1; break;
+			case 'w':
+				/* -w80 or -w 80 */
+				if (a[j + 1]) {
+					o->width = atoi(a + j + 1);
+				} else if (i + 1 < argc) {
+					o->width = atoi(argv[++i]);
+				}
+				if (o->width < 20) {
+					fprintf(stderr, "hexapla: -w needs a width of 20 or more\n");
+					return -1;
+				}
+				j = (int)strlen(a) - 1;
+				break;
 			case 's':
 				patbuf[0] = '\0';
 				if (a[j + 1]) {
@@ -779,26 +840,37 @@ static void print_logo(FILE *out)
 
 static void repl_help(void)
 {
+	/* a NULL description breaks the list into groups */
 	static const struct { const char *cmd, *desc; } rows[] = {
 		{ "John 3:16",   "a single verse" },
-		{ "Gen 1:1-10",  "a range, and 1:31-2:2 crosses chapters" },
+		{ "Gen 1:1-10",  "a range; 1:31-2:2 crosses chapters" },
 		{ "Psalms 22",   "a whole chapter" },
 		{ "Jude",        "a whole book" },
-		{ "-g Matt 5:3", "pick the columns for one lookup (-g -l -e)" },
-		{ "-gle",        "set the default columns and their order" },
-		{ "-s shepherd", "search the verse text" },
-		{ "books",       "list every book and its abbreviations" },
+		{ NULL,          NULL },
+		{ "-g Matt 5:3", "columns for one lookup: -g Greek, -l Latin," },
+		{ "",            "-e English; -el is English then Latin" },
+		{ "-el",         "on its own, sets the columns for the session" },
+		{ "-s shepherd", "search the verse text; no quoting needed" },
+		{ "-p Gen 1",    "one verse per line, tab separated, unwrapped" },
+		{ "-w 60",       "wrap to a fixed width for this lookup" },
+		{ NULL,          NULL },
+		{ "books",       "every book, its editions and abbreviations" },
 		{ "?",           "this help" },
-		{ "q",           "quit" },
+		{ "q",           "quit (ctrl-D works too)" },
 	};
 	size_t i;
 
 	fputc('\n', stdout);
-	for (i = 0; i < sizeof rows / sizeof rows[0]; i++)
-		printf("  %s%-13s%s %s\n", C_BOLD, rows[i].cmd, C_RESET,
-		       rows[i].desc);
-	fputs("\n  Up and down arrows walk earlier references; history is kept\n"
-	      "  between sessions.\n\n", stdout);
+	for (i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+		if (!rows[i].desc)
+			fputc('\n', stdout);
+		else
+			printf("  %s%-13s%s %s\n", C_BOLD, rows[i].cmd, C_RESET,
+			       rows[i].desc);
+	}
+	fputs("\n  Up and down arrows recall earlier references, and that history\n"
+	      "  is kept between sessions.  Run 'hexapla -h' in the shell for the\n"
+	      "  command-line options and environment variables.\n\n", stdout);
 }
 
 /* ---------- history ---------- */
@@ -988,6 +1060,7 @@ static void repl(void)
 		/* Flags on a command apply to that command only; a line of
 		 * nothing but language flags sets the session default. */
 		norder = 0;
+		plain = 0;
 		first = o.list ? 0 : parse_flags(argc, argv, &o, patbuf, sizeof patbuf);
 		if (first < 0) {
 			free(line);
@@ -1027,39 +1100,76 @@ static void repl(void)
 
 /* ---------- main ---------- */
 
-static void usage(void)
+/* -h prints to stdout and succeeds so it can be paged or grepped; a usage
+ * error prints to stderr and fails. */
+static void usage(FILE *out, int status)
 {
-	fputs("usage: hexapla [-gle] [book [chapter[:verse[-verse]]]]\n"
-	      "       hexapla [-gle] -s pattern\n"
-	      "       hexapla -L\n"
+	fputs("usage: hexapla [options] [book [chapter[:verse[-verse]]]]\n"
+	      "       hexapla [options] -s pattern\n"
+	      "       hexapla [options] -L\n"
 	      "\n"
-	      "Look up Bible verses in Greek (Septuagint / Greek NT), Latin\n"
-	      "(Vulgate) and English (Douay-Rheims).\n"
+	      "Look up Bible verses in Greek (Septuagint / SBL Greek NT), Latin\n"
+	      "(Clementine Vulgate) and English (Douay-Rheims) side by side.\n"
 	      "\n"
-	      "  -g  Greek     -l  Latin     -e  English\n"
-	      "      combine to choose the columns and their order:\n"
-	      "      -eg shows English then Greek (default: all three)\n"
-	      "  -s  search verse text for a pattern\n"
-	      "  -L  list books and the editions each is available in\n"
-	      "  -1  print once and exit instead of staying at the prompt\n"
+	      "columns:\n"
+	      "  -g -l -e     Greek, Latin, English.  Combine them to choose the\n"
+	      "               columns and their order: -eg is English then Greek.\n"
+	      "               The default is all three, Greek first.\n"
 	      "\n"
-	      "With no reference, or after one is shown, hexapla stays at an\n"
-	      "interactive prompt: type another reference, use the up arrow to\n"
-	      "recall earlier ones, or 'q' to quit.  Output is not interactive\n"
-	      "when it is piped or redirected.\n"
+	      "what to show:\n"
+	      "  -s pattern   search the verse text.  Takes the rest of the line,\n"
+	      "               so the pattern needs no quoting.  Greek search is\n"
+	      "               byte-exact: match accents and case\n"
+	      "  -L           list every book, the editions it appears in, and\n"
+	      "               the abbreviations accepted for it\n"
 	      "\n"
-	      "Set HEXAPLA_LANGS (e.g. 'gl' or 'elg') to change the default\n"
-	      "columns and order; command-line flags override it.\n"
+	      "output:\n"
+	      "  -p           one whole verse per line, tab separated and never\n"
+	      "               wrapped: 'Book C:V<TAB>TAG<TAB>text'.  For fzf,\n"
+	      "               grep, awk and cut, which read a line at a time.\n"
+	      "               Implies -1\n"
+	      "  -C           keep colour when the output is not a terminal, for\n"
+	      "               'fzf --ansi' or 'less -R'.  Leave it off when\n"
+	      "               something is parsing the fields\n"
+	      "  -w cols      wrap to this width instead of the terminal's\n"
+	      "               (minimum 20).  -w60 and -w 60 both work\n"
+	      "  -1           print once and exit instead of staying at the\n"
+	      "               prompt\n"
+	      "  -h           this help\n"
+	      "\n"
+	      "the prompt:\n"
+	      "  With no reference -- or after one is shown -- hexapla stays at an\n"
+	      "  interactive prompt.  Type another reference there, use the up and\n"
+	      "  down arrows to recall earlier ones, '?' for help, 'q' to quit.\n"
+	      "  Colour, paging and the prompt all switch off when the output is\n"
+	      "  piped or redirected, so scripts still get one clean result.\n"
+	      "\n"
+	      "environment:\n"
+	      "  HEXAPLA_LANGS      default columns and order, e.g. 'ge'; the\n"
+	      "                     -g/-l/-e flags override it\n"
+	      "  HEXAPLA_DATA       directory holding grb.tsv, vul.tsv, drb.tsv\n"
+	      "  HEXAPLA_HISTFILE   prompt history file.  Defaults to\n"
+	      "                     $XDG_STATE_HOME/hexapla/history, else\n"
+	      "                     ~/.local/state/hexapla/history\n"
+	      "  PAGER              pager for terminal output (default 'less -FRX')\n"
 	      "\n"
 	      "examples:\n"
-	      "  hexapla John 3:16          hexapla Gen 1:1-10\n"
-	      "  hexapla Psalms 22          hexapla 1 Cor 13:1-13\n"
-	      "  hexapla -g Matt 5:3-12     hexapla -s 'shepherd'\n"
+	      "  hexapla John 3:16            a verse in all three languages\n"
+	      "  hexapla Gen 1:1-10           a range of verses\n"
+	      "  hexapla Gen 1:31-2:2         a range across chapters\n"
+	      "  hexapla Psalms 22            a whole chapter\n"
+	      "  hexapla Jude                 a whole book\n"
+	      "  hexapla -g Matt 5:3-12       Greek only\n"
+	      "  hexapla -el 1 Cor 13         English then Latin\n"
+	      "  hexapla -s vale of tears     search every column\n"
+	      "  hexapla -pe Psalms | fzf | cut -f1 | xargs hexapla\n"
+	      "                               fuzzy-find a psalm, then read it\n"
+	      "                               in all three languages\n"
 	      "\n"
-	      "Books use Douay-Rheims names and numbering (1-4 Kings, Psalms\n"
-	      "numbered per the Vulgate); modern abbreviations like 1Sam are\n"
-	      "also accepted. See -L for the full list.\n", stderr);
-	exit(2);
+	      "Books use Douay-Rheims names and numbering (1-4 Kings; Psalms\n"
+	      "numbered per the Vulgate); modern names and abbreviations like\n"
+	      "1Sam are accepted on input.  See -L for the full list.\n", out);
+	exit(status);
 }
 
 int main(int argc, char **argv)
@@ -1075,7 +1185,7 @@ int main(int argc, char **argv)
 	if (first < 0)
 		return 1;
 	if (o.help)
-		usage();
+		usage(stdout, 0);
 	argc -= first + 1;
 	argv += first + 1;
 
@@ -1097,17 +1207,22 @@ int main(int argc, char **argv)
 	memcpy(deforder, order, sizeof order);
 	defnorder = norder;
 
-	use_color = isatty(STDOUT_FILENO);
-	if (use_color) {
+	is_tty = isatty(STDOUT_FILENO);
+	use_color = is_tty || o.forcecolor;
+	if (is_tty) {
 		struct winsize ws;
 		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
 			termwidth = ws.ws_col;
 	}
-	interactive = use_color && isatty(STDIN_FILENO) && !o.once;
+	if (o.width)
+		termwidth = o.width;
+	/* -p is a format for other programs to read, so it stops at one
+	 * result rather than dropping into the prompt */
+	interactive = is_tty && isatty(STDIN_FILENO) && !o.once && !plain;
 
 	/* Nothing to show and nowhere to prompt: explain and stop. */
 	if (!interactive && !o.list && !o.pat && argc == 0)
-		usage();
+		usage(stderr, 2);
 
 	datapath = datadir();
 

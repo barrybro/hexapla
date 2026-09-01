@@ -70,6 +70,46 @@ To change the default columns without typing flags every time, set
 `HEXAPLA_LANGS` in your shell rc — e.g. `export HEXAPLA_LANGS=ge` shows
 Greek and English only, Greek first. Command-line flags override it.
 
+## Piping to other tools
+
+The reading layout — a reference above its wrapped columns — is built for
+eyes, not for `fzf` or `grep`, which work a line at a time and would only
+ever see fragments. `-p` switches to one whole verse per line, tab
+separated and never wrapped:
+
+```
+$ hexapla -pe Gen 1:1
+Genesis 1:1	DRB	In the beginning God created heaven, and earth.
+```
+
+The fields are `reference`, `edition tag`, `text`. Because the reference
+comes first and is spelled the way hexapla reads it, a chosen line goes
+straight back in — fuzzy-find an English psalm, then read it in all three
+languages:
+
+```sh
+hexapla -pe Psalms | fzf | cut -f1 | xargs hexapla
+```
+
+Everything else composes the usual way:
+
+```sh
+hexapla -p Gen | cut -f3            # bare text
+hexapla -pL | awk -F'\t' '$2 ~ /VUL/'
+hexapla -pe Matt | grep -i 'blessed'
+```
+
+Two flags help elsewhere:
+
+- `-C` keeps colour when the output is not a terminal, for `fzf --ansi`
+  or `less -R`. Leave it off when something is parsing the fields.
+- `-w 60` wraps to a fixed width instead of the terminal's, for a fixed
+  column in a file or a pane.
+
+Without `-p`, piping still works and simply prints once and exits —
+colour, pager and the prompt all switch off when the output is not a
+terminal.
+
 ## Names and numbering
 
 Books are displayed under their Douay-Rheims names and follow the
