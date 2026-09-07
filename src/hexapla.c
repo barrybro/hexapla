@@ -66,6 +66,25 @@ static int norder;
 static int deforder[NED];
 static int defnorder;
 
+/* -w from the command line: the session's baseline width, which a -w on a
+ * single prompt command overrides for that command only */
+static int defwidth;
+
+/* The terminal can be resized between prompt commands, so measure it afresh
+ * for each one rather than trusting the size we saw at startup.  With no
+ * terminal to measure (output redirected) the width is whatever -w said, or
+ * the 80 columns everything else assumes. */
+static void measure_term(void)
+{
+	struct winsize ws;
+
+	termwidth = 80;
+	if (is_tty && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+		termwidth = ws.ws_col;
+	if (defwidth)
+		termwidth = defwidth;
+}
+
 static void add_lang(int ed)
 {
 	int i;
@@ -1232,6 +1251,9 @@ static void repl(void)
 			free(line);
 			continue;
 		}
+		measure_term();
+		if (o.width)
+			termwidth = o.width;
 		run_command(&o, argc - first, argv + first);
 		free(line);
 	}
@@ -1387,13 +1409,8 @@ int main(int argc, char **argv)
 
 	is_tty = isatty(STDOUT_FILENO);
 	use_color = is_tty || o.forcecolor;
-	if (is_tty) {
-		struct winsize ws;
-		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-			termwidth = ws.ws_col;
-	}
-	if (o.width)
-		termwidth = o.width;
+	defwidth = o.width;
+	measure_term();
 	/* -p is a format for other programs to read, so it stops at one
 	 * result rather than dropping into the prompt */
 	interactive = is_tty && isatty(STDIN_FILENO) && !o.once && !plain;
