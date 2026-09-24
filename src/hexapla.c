@@ -1112,7 +1112,11 @@ static void hist_save(void)
 
 	if (!f)
 		return;
+	/* libedit (macOS's stand-in for readline) reports itself as 4.2 and
+	 * has no append_history(); rewrite the whole file there instead. */
+#if RL_READLINE_VERSION >= 0x0500
 	if (append_history(1, f) != 0)
+#endif
 		write_history(f);
 	history_truncate_file(f, HISTMAX);
 }
