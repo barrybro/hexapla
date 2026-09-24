@@ -22,7 +22,7 @@ DRB │ For God so loved the world, as to give his only begotten Son; that
 ## Usage
 
 ```
-hexapla [-gle] book [chapter[:verse[-verse]]]
+hexapla [-gle] [book [chapter[:verse[-verse]]]]
 hexapla [-gle] -s pattern
 hexapla -L
 ```
@@ -34,16 +34,85 @@ hexapla -L
 - `hexapla -g Matt 5:3-12` — choose languages (`-g` Greek, `-l` Latin,
   `-e` English); flags combine, and their order sets the column order
   (`-eg` shows English then Greek)
-- `hexapla -s 'vale of tears'` — search verse text (Greek search is
-  byte-exact: match accents and case)
+- `hexapla -s 'vale of tears'` — search verse text. The language flags
+  scope the search, because `-s` only looks at the columns being shown:
+  `hexapla -e -s mercy` searches the English alone, `hexapla -l -s
+  dominus` the Latin. Greek is matched accent for accent, but text and
+  pattern are both normalized to Unicode NFC first, so it does not
+  matter which of two identical-looking accent characters you type
 - `hexapla -L` — list all books, the editions each is available in, and
   accepted abbreviations
 
 Output is paged through `$PAGER` (default `less`) when on a terminal.
 
+## The prompt
+
+Run `hexapla` with no arguments and it opens at a prompt; quitting the
+pager after a lookup returns there too, so you can keep reading without
+restarting:
+
+```
+hexapla> John 3:16
+hexapla> -g Matt 5:3-12
+hexapla> -s vale of tears
+```
+
+Anything that works on the command line works at the prompt, and search
+patterns need no quoting. Up and down arrows walk earlier references,
+and that history is kept between sessions (in
+`$XDG_STATE_HOME/hexapla/history`, or `~/.local/state/hexapla/history`;
+override with `HEXAPLA_HISTFILE`). A line of nothing but language flags
+— `-el` — sets the default columns for the rest of the session.
+
+Type `?` for help, `books` to list every book, `q` (or ctrl-D) to quit.
+
+The prompt only appears when input and output are both terminals, so
+pipes and redirects still print once and exit; `-1` forces that
+behaviour on a terminal too.
+
 To change the default columns without typing flags every time, set
 `HEXAPLA_LANGS` in your shell rc — e.g. `export HEXAPLA_LANGS=ge` shows
 Greek and English only, Greek first. Command-line flags override it.
+
+## Piping to other tools
+
+The reading layout — a reference above its wrapped columns — is built for
+eyes, not for `fzf` or `grep`, which work a line at a time and would only
+ever see fragments. `-p` switches to one whole verse per line, tab
+separated and never wrapped:
+
+```
+$ hexapla -pe Gen 1:1
+Genesis 1:1	DRB	In the beginning God created heaven, and earth.
+```
+
+The fields are `reference`, `edition tag`, `text`. Because the reference
+comes first and is spelled the way hexapla reads it, a chosen line goes
+straight back in — fuzzy-find an English psalm, then read it in all three
+languages:
+
+```sh
+hexapla -pe Psalms | fzf | cut -f1 | xargs hexapla
+```
+
+Everything else composes the usual way:
+
+```sh
+hexapla -p Gen | cut -f3            # bare text
+hexapla -pL | awk -F'\t' '$2 ~ /VUL/'
+hexapla -pe Matt | grep -i 'blessed'
+```
+
+Two flags help elsewhere:
+
+- `-C` keeps colour when the output is not a terminal, for `fzf --ansi`
+  or `less -R`. Leave it off when something is parsing the fields.
+- `-w 60` wraps to a fixed width instead of the terminal's, for a fixed
+  column in a file or a pane.
+
+Without `-p`, piping still works and simply prints once and exits —
+colour, pager and the prompt all switch off when the output is not a
+terminal.
 
 ## Names and numbering
 
@@ -79,6 +148,10 @@ Modern names and common abbreviations (`Joshua`, `Rev`, `1 Chronicles`,
 make
 sudo make install    # installs to /usr/local, data to /usr/local/share/hexapla
 ```
+
+The prompt uses GNU readline for line editing and history. To build
+without that dependency, `make READLINE=0` — the prompt still works and
+still records history, but without arrow-key recall.
 
 To run from the source tree without installing, run it from this
 directory (it finds `./data`), or point `HEXAPLA_DATA` at the data
